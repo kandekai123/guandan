@@ -1,0 +1,1184 @@
+// /==============================================================/
+// /  掼蛋AI策略 v17.0 — 基于v5.0全面增强版                                  /
+// /==============================================================/
+// 核心改进(v17.0新增):
+// 1. 重写scorePass: 用"单手平均价值×衰减"替代"全部手牌乘积"
+// 2. 跟牌进度奖励: 出牌后手数减少给予大幅奖励
+// 3. 绝对不炸队友
+// 4. 逢人配保护: 保留给炸弹/同花顺，普通牌型降权
+// 5. 区分先出/跟牌、早中后期、对手/队友
+// 6. 炸弹使用: 只在关键时刻使用
+
+// === 辅助函数 ===
+function _cardValue(rank, level) {
+  if (rank === 16) return 17;
+  if (rank === 15) return 16;
+  if (rank === level) return 15;
+  return rank;
+}
+
+function _estimateMinHands(hand, gameAPI) {
+  if (!hand || !hand.length) return 0;
+  var norms = hand.filter(function(c) { return !gameAPI.isWild(c); });
+  var wc = hand.length - norms.length;
+  var cnt = {};
+  norms.forEach(function(c) { cnt[c.rank] = (cnt[c.rank] || 0) + 1; });
+  var fours = 0, threes = 0, pairs = 0, singles = 0;
+  for (var k in cnt) {
+    var r = cnt[k];
+    fours += Math.floor(r / 4); r %= 4;
+    threes += Math.floor(r / 3); r %= 3;
+    pairs += Math.floor(r / 2); r %= 2;
+    singles += r;
+  }
+  var hands = fours;
+  var tp = Math.min(threes, pairs);
+  hands += tp;
+  threes -= tp; pairs -= tp;
+  hands += threes + pairs + singles;
+  hands = Math.max(hands - wc, 1);
+  return Math.max(hands, 1);
+}
+
+function _isBomb(play) { return play.type >= 8; }
+
+function _playFromDetect(cards, ht, level) {
+  var type = ht.t;
+  var tripleSum = 0, tripleMaxValue = 0;
+  if (type === 4) {
+    var cnt = {};
+    cards.forEach(function(c) { cnt[c.rank] = (cnt[c.rank] || 0) + 1; });
+    for (var rk in cnt) {
+      if (cnt[rk] >= 3) {
+        var tripleCards = cards.filter(function(c) { return c.rank === +rk; }).slice(0, 3);
+        tripleSum = tripleCards.reduce(function(s, c) { return s + _cardValue(c.rank, level); }, 0);
+        tripleMaxValue = _cardValue(+rk, level);
+        break;
+      }
+    }
+  }
+  var maxFace = 0;
+  cards.forEach(function(c) { var fv = _cardValue(c.rank, level); if (fv > maxFace) maxFace = fv; });
+  return {
+    type: type,
+    cards: cards.slice(),
+    cardCount: cards.length,
+    totalValue: cards.reduce(function(s, c) { return s + _cardValue(c.rank, level); }, 0),
+    maxValue: maxFace,
+    maxFaceValue: maxFace,
+    usesWild: cards.some(function(c) { return c.rank === level && c.suit === '♥'; }),
+    rankValue: ht.r || 0,
+    tripleSum: tripleSum,
+    tripleMaxValue: tripleMaxValue,
+    id: '_p' + (++_playFromDetect._pid)
+  };
+}
+_playFromDetect._pid = 0;
+
+function _basePlayScore(play, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (play.type === 14) return cfg.bombBase.fourJokers;
+  if (play.type === 10) return cfg.bombBase.flushStraight + play.maxFaceValue * cfg.bombRankMul;
+  if (play.type >= 8 && play.type !== 10) {
+    var bombSize = {8:4, 9:5, 11:6, 12:7, 13:8}[play.type];
+    return (cfg.bombBase[bombSize] || 200) + play.rankValue * cfg.bombRankMul;
+  }
+  if (play.type === 4) return play.tripleSum * cfg.typeCoeff.triple + cfg.triplePairKicker;
+  var coeff = cfg.typeCoeff[{ 1: 'single', 2: 'pair', 3: 'triple', 5: 'straight', 6: 'consecPairs', 7: 'consecTriples' }[play.type]] || 1.0;
+  return play.totalValue * coeff;
+}
+
+function _handFactor(n, cfg) { return Math.exp(-(cfg || EVAL_CONFIG).handAlpha * (n - 1)); }
+function _cardCountFactor(r, cfg) { cfg = cfg || EVAL_CONFIG; return 1 + cfg.cardGamma * (27 - r) / 27; }
+function _phaseFactor(R, cfg) { cfg = cfg || EVAL_CONFIG; return 1 + cfg.phaseBeta * Math.exp(-R / cfg.phaseLambda); }
+function _bombReserve(r, cfg) { cfg = cfg || EVAL_CONFIG; return 1 + cfg.bombDelta * Math.max(0, (cfg.bombThreshold - r) / cfg.bombThreshold); }
+function _wildPenalty(play, bestPri, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (!play.usesWild) return 0;
+  var actual = play.wildPriority || 7;
+  var pen = cfg.wildPerLevel * Math.max(0, actual - bestPri);
+  if (actual === 5) pen += cfg.wildMarginal;
+  return pen;
+}
+
+function _findBestWildPriority(hand, level, gameAPI) {
+  var wilds = hand.filter(function(c) { return gameAPI.isWild(c); });
+  if (!wilds.length) return 7;
+  var norms = hand.filter(function(c) { return !gameAPI.isWild(c); });
+  var cnt = {};
+  norms.forEach(function(c) { cnt[c.rank] = (cnt[c.rank] || 0) + 1; });
+  for (var r in cnt) { if (cnt[r] >= 3 && +r < 15) return 1; }
+  for (var r2 in cnt) { if (cnt[r2] >= 4) return 5; }
+  for (var r3 in cnt) { if (cnt[r3] >= 1 && +r3 < 15) return 6; }
+  return 7;
+}
+
+// === v17.0: 新增辅助函数 ===
+
+// 计算手牌中单牌数量（排除大小王和逢人配）
+function _countPureSingles(hand, level, gameAPI) {
+  var norms = hand.filter(function(c) {
+    return !gameAPI.isWild(c) && c.rank !== 15 && c.rank !== 16;
+  });
+  var cnt = {};
+  norms.forEach(function(c) { cnt[c.rank] = (cnt[c.rank] || 0) + 1; });
+  var singles = 0;
+  for (var k in cnt) { if (cnt[k] === 1) singles++; }
+  return singles;
+}
+
+// 检测手牌中纯单张的最长连续序列长度（用于顺子潜力评估）
+function _getLongestConsecutiveSingles(hand) {
+  var rankCounts = {};
+  for (var i = 0; i < hand.length; i++) {
+    var r = hand[i].rank;
+    if (r < 15) rankCounts[r] = (rankCounts[r] || 0) + 1;
+  }
+  var singleRanks = [];
+  for (var r in rankCounts) {
+    if (rankCounts[r] === 1) singleRanks.push(parseInt(r));
+  }
+  singleRanks.sort(function(a, b) { return a - b; });
+  if (singleRanks.length === 0) return 0;
+  var maxLen = 1, curLen = 1;
+  for (var i = 1; i < singleRanks.length; i++) {
+    if (singleRanks[i] === singleRanks[i - 1] + 1) {
+      curLen++;
+      if (curLen > maxLen) maxLen = curLen;
+    } else {
+      curLen = 1;
+    }
+  }
+  return maxLen;
+}
+
+// v17.0: 残局单牌策略（函数驱动）
+// 情形1：单牌>=3张（不含王和逢人配），先手时优先打单
+// 情形2-4：只剩2张单牌，只剩1名对手时，先大后小（除非是最小单牌）
+function _lateGameSingleBonus(p, hand, decomp, state, gameAPI) {
+  var cfg = EVAL_CONFIG;
+  var pureSingles = _countPureSingles(hand, state.level, gameAPI);
+  var phase = _gamePhase(state.myRemCards, cfg);
+  var bonus = 0;
+
+  // 情形1: 单牌>=3张 + 中期/晚期 → 优先打单（奖励单牌出牌）
+  if (pureSingles >= 3 && phase !== 'early' && p.type === 1 && p.cardCount === 1) {
+    bonus += 800; // v17.5增强
+    if (pureSingles >= 5) bonus += 500; // v17.5增强
+  }
+
+  // 情形2-4: 只有2张单牌，进入残局特定条件
+  if (pureSingles === 2 && p.type === 1 && p.cardCount === 1) {
+    var oppAlive = state.oppCards.filter(function(c) { return c > 0; });
+    var tmAlive = state.tmCards.filter(function(c) { return c > 0; });
+    var oppMin = oppAlive.length ? Math.min.apply(null, oppAlive) : 999;
+
+    // 情形2: 只剩1名对手（无队友），对手<=2张 → 大单优先
+    if (tmAlive.length === 0 && oppAlive.length === 1 && oppMin <= 2) {
+      // 大单奖励，小单惩罚（先大后小）
+      var singleValues = decomp.filter(function(d) { return d.type === 1 && d.cardCount === 1; })
+        .map(function(d) { return d.maxValue; }).sort(function(a, b) { return a - b; });
+      if (singleValues.length >= 2) {
+        if (p.maxValue === singleValues[singleValues.length - 1]) bonus += 800;
+        else if (p.maxValue === singleValues[0]) bonus -= 400;
+      }
+    }
+
+    // 情形3&4: 只剩1名对手在下家，队友在上家
+    if (tmAlive.length === 1 && oppAlive.length === 1) {
+      var dsIdx = (state.pi + 1) % 4;
+      // 检查对手是否在下家
+      var isOppDownstream = false;
+      for (var oi = 0; oi < 4; oi++) {
+        if (oi !== state.pi && !gameAPI.areTeammates(oi, state.pi) && gameAPI.finished.indexOf(oi) < 0) {
+          if (oi === dsIdx) isOppDownstream = true;
+        }
+      }
+      if (isOppDownstream) {
+        var singleValues = decomp.filter(function(d) { return d.type === 1 && d.cardCount === 1; })
+          .map(function(d) { return d.maxValue; }).sort(function(a, b) { return a - b; });
+        if (singleValues.length >= 2) {
+          var biggest = singleValues[singleValues.length - 1];
+          var smallest = singleValues[0];
+          // 情形4: 对手只有1张 → 先大后小
+          if (oppMin === 1) {
+            if (p.maxValue === biggest) bonus += 1000;
+            else if (p.maxValue === smallest) bonus -= 600;
+          }
+          // 情形3: 对手<=2张 → 先大后小，除非是最小单牌（已出最小）
+          else if (oppMin <= 2) {
+            // 检查当前单牌是否是最小可能单牌（如3，且所有更小的已出）
+            var isSmallestPossible = true; // 简化判断：总是先大后小，除非明确是最小
+            if (p.maxValue === biggest) bonus += 600;
+            else if (p.maxValue === smallest) bonus -= 300;
+          }
+        }
+      }
+    }
+  }
+
+  return bonus;
+}
+
+// v17.0: 下家送牌检测——下家对手只剩1张且自己还有4张+时，禁止出单张
+function _downstreamSingleBlock(p, state, gameAPI) {
+  if (p.type !== 1 || p.cardCount !== 1) return 0;
+  var dsIdx = (state.pi + 1) % 4;
+  if (gameAPI.areTeammates(dsIdx, state.pi)) return 0;
+  if (gameAPI.finished.indexOf(dsIdx) >= 0) return 0;
+  var dsCards = gameAPI.players[dsIdx].hand.length;
+  if (dsCards === 1 && state.myRemCards >= 4) return -5000; // 绝对禁止
+  if (dsCards === 2 && state.myRemCards >= 4) return -3000; // 强烈禁止
+  return 0;
+}
+
+// v17.0: 下家对子送牌检测——下家只剩1-2张可能是对子时，谨慎出对子
+function _downstreamPairBlock(p, state, gameAPI) {
+  if (p.type !== 2 || p.cardCount !== 2) return 0;
+  var dsIdx = (state.pi + 1) % 4;
+  if (gameAPI.areTeammates(dsIdx, state.pi)) return 0;
+  if (gameAPI.finished.indexOf(dsIdx) >= 0) return 0;
+  var dsCards = gameAPI.players[dsIdx].hand.length;
+  if (dsCards === 2 && state.myRemCards >= 4) return -2000;
+  return 0;
+}
+
+// v17.0: 炸弹保留策略——早期不用炸弹，小炸弹即可压时不用大炸弹
+function _bombReservePenalty(p, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (!_isBomb(p)) return 0;
+  var penalty = 0;
+
+  // 早期阶段（手牌多）→ 大力保留炸弹
+  var phase = _gamePhase(state.myRemCards, cfg);
+  if (phase === 'early') {
+    penalty += 3000;
+  } else if (phase === 'mid') {
+    penalty += 1500;
+  }
+
+  // 大炸弹压小炸弹的惩罚——对手出小炸弹，我们用大炸弹压
+  if (state.leadIsBomb && state.upstreamIsOpponent) {
+    var leadScore = state.leadPlay ? _basePlayScore(state.leadPlay, cfg) : 0;
+    var myScore = _basePlayScore(p, cfg);
+    // 如果我们炸弹远大于对手炸弹（大炸弹压小炸弹）→ 惩罚
+    if (myScore > leadScore * 1.5 && leadScore > 0) {
+      penalty += (myScore - leadScore) * 2;
+    }
+    // 如果我们有小炸弹可压，却用更大炸弹 → 额外惩罚
+    if (state.hasSmallerBomb) {
+      penalty += 2500;
+    }
+  }
+
+  return penalty;
+}
+
+// === EVAL_CONFIG ===
+var EVAL_CONFIG = {
+  typeCoeff: { single: 1.00, pair: 1.15, triple: 1.30, straight: 1.45, triplePair: 1.30, consecPairs: 1.65, consecTriples: 1.85 },
+  triplePairKicker: 8,
+  bombBase: { 4: 200, 5: 400, flushStraight: 500, 6: 600, 7: 800, 8: 1000, fourJokers: 1500 },
+  bombRankMul: 3,
+  handAlpha: 0.5,
+  cardGamma: 0.3,
+  phaseBeta: 0.5,
+  phaseLambda: 2.5,
+  urgencyOpponent: 0.8,
+  urgencySelf: 1.0,
+  urgencyTeammate: 1.2,
+  prWeight: 0.15,
+  prGap: 3,
+  prPwin: { 17: 0.95, 16: 0.95, 15: 0.95, 14: 0.90, 13: 0.80, 12: 0.70, 11: 0.55, 10: 0.40 },
+  prDefaultPwin: 0.25,
+  bombDelta: 0.4,
+  bombThreshold: 10,
+  wildPerLevel: 10,
+  wildMarginal: 20,
+  teamWFewer: 0.10,
+  teamWMatch: 0.15,
+  teamFewerMin: 3,
+  teamFewerMax: 5,
+  teamMatchMax: 2,
+  partnerWBase: 20,
+  partnerRecBigJoker: 1.5,
+  partnerRecStrong: 1.2,
+  partnerRecNormal: 1.0,
+  partnerRecWeak: 0.6,
+  partnerCardLe2: 0.3,
+  partnerCard3to5: 0.7,
+  partnerCardGt5: 1.0,
+  partnerDespLe2: 0.3,
+  partnerDesp3to4: 0.7,
+  partnerDespGe5: 1.0,
+  partnerBombOnBomb: 500,
+  bombThresholdSingle: 10,
+  bombThresholdPair: 8,
+  bombThresholdTriple: 8,
+  bombThresholdLow: 300,
+  bombSaveTeammateChance: true,
+  upstreamBombEarlyPenalty: 200,
+  upstreamBombMinScore: 250,
+  avgStrongThresh: 0.35,
+  avgWeakThresh: 0.65,
+  avgEarlyCards: 20,
+  avgMidCards: 10,
+  avgEarlyFactor: 0.30,
+  avgMidFactor: 0.15,
+  avgLateFactor: 0.05,
+  avgMaxBonus: 50,
+  blockBaseReward: 15,
+  blockMidMul: 1.0,
+  blockLateMul: 1.5,
+  blockCloseThresh: 2,
+  blockSizeCoeff: 0.5,
+  blockEmergencyMul: 3,
+  blockEmergencySizeCoeff: 0.8,
+  blockQualityEta: 1.2
+};
+
+// === 手牌分解引擎 ===
+function _decomposeHand(hand, state, gameAPI, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var level = state.level;
+  var allPlays = [];
+  var types = [1, 2, 3, 4, 5, 6, 7, 10];
+  for (var i = 0; i < types.length; i++) {
+    var found = gameAPI.findType(hand, types[i]);
+    if (found && found.length) {
+      for (var j = 0; j < found.length; j++) {
+        var cards = found[j];
+        var ht = gameAPI.detect(cards);
+        if (ht) allPlays.push(_playFromDetect(cards, ht, level));
+      }
+    }
+  }
+  var bombs = gameAPI.findBombs(hand);
+  if (bombs && bombs.length) {
+    for (var k = 0; k < bombs.length; k++) {
+      var bc = bombs[k];
+      var bh = gameAPI.detect(bc);
+      if (bh) allPlays.push(_playFromDetect(bc, bh, level));
+    }
+  }
+
+  var bombPlays = [];
+  var regularPlays = [];
+  for (var pi = 0; pi < allPlays.length; pi++) {
+    if (allPlays[pi].type >= 8) bombPlays.push(allPlays[pi]);
+    else regularPlays.push(allPlays[pi]);
+  }
+
+  function greedyDecomposeNoBomb(cards) {
+    var plays = [];
+    var rem = cards.slice();
+    var priorities = [
+      { type: 7, name: '钢板' },
+      { type: 6, name: '三连对' },
+      { type: 5, name: '顺子' },
+      { type: 4, name: '三带二' },
+      { type: 3, name: '三条' },
+      { type: 2, name: '对子' }
+    ];
+    for (var pi2 = 0; pi2 < priorities.length; pi2++) {
+      var type = priorities[pi2].type;
+      var found2 = gameAPI.findType(rem, type);
+      while (found2 && found2.length > 0) {
+        var best = found2[0];
+        for (var fi = 1; fi < found2.length; fi++) {
+          if (found2[fi].length > best.length) best = found2[fi];
+        }
+        var ht2 = gameAPI.detect(best);
+        if (ht2) {
+          plays.push(_playFromDetect(best, ht2, level));
+          var ids = {};
+          best.forEach(function(c) { ids[c.id] = true; });
+          rem = rem.filter(function(c) { return !ids[c.id]; });
+        } else break;
+        found2 = gameAPI.findType(rem, type);
+      }
+    }
+    for (var si = 0; si < rem.length; si++) {
+      plays.push(_playFromDetect([rem[si]], { t: 1, r: rem[si].rank }, level));
+    }
+    return plays;
+  }
+
+  var bestScore = -Infinity;
+  var bestDecomp = null;
+
+  function tryDecomp(bombs2, remaining) {
+    var regular = greedyDecomposeNoBomb(remaining);
+    var all = bombs2.concat(regular);
+    try {
+      var sc = _proactiveScore(all, state, cfg);
+      if (sc > bestScore) { bestScore = sc; bestDecomp = all; }
+    } catch (e) {}
+  }
+
+  tryDecomp([], hand);
+
+  for (var bi = 0; bi < bombPlays.length; bi++) {
+    var b = bombPlays[bi];
+    var ids1 = {};
+    b.cards.forEach(function(c) { ids1[c.id] = true; });
+    var rem1 = hand.filter(function(c) { return !ids1[c.id]; });
+    var bp = _playFromDetect(b.cards, b.type >= 8 ? { t: b.type, r: b.rankValue } : gameAPI.detect(b.cards), level);
+    tryDecomp([bp], rem1);
+
+    for (var bj = bi + 1; bj < bombPlays.length; bj++) {
+      var b2 = bombPlays[bj];
+      var overlap = false;
+      for (var ck = 0; ck < b2.cards.length; ck++) { if (ids1[b2.cards[ck].id]) { overlap = true; break; } }
+      if (overlap) continue;
+      var ids2 = {};
+      b2.cards.forEach(function(c) { ids2[c.id] = true; });
+      var rem2 = rem1.filter(function(c) { return !ids2[c.id]; });
+      var bp2 = _playFromDetect(b2.cards, b2.type >= 8 ? { t: b2.type, r: b2.rankValue } : gameAPI.detect(b2.cards), level);
+      tryDecomp([bp, bp2], rem2);
+    }
+  }
+
+  return bestDecomp || greedyDecomposeNoBomb(hand);
+}
+
+// === 评估函数 ===
+function _avgStrength(cards, level) {
+  if (!cards || !cards.length) return 0.5;
+  var total = 0;
+  for (var i = 0; i < cards.length; i++) total += (_cardValue(cards[i].rank, level) - 2) / 15;
+  return total / cards.length;
+}
+
+function _gamePhase(r, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (r >= cfg.avgEarlyCards) return 'early';
+  if (r >= cfg.avgMidCards) return 'mid';
+  return 'late';
+}
+
+function _playRecoverBonus(plays, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var w = cfg.prWeight, gap = cfg.prGap;
+  function pw(v) { return cfg.prPwin[v] !== undefined ? cfg.prPwin[v] : cfg.prDefaultPwin; }
+  var groups = {};
+  plays.forEach(function(p) {
+    if (_isBomb(p)) return;
+    (groups[p.type] = groups[p.type] || []).push(p);
+  });
+  var bonus = 0;
+  for (var t in groups) {
+    var grp = groups[t];
+    if (grp.length < 2) continue;
+    grp.sort(function(a, b) { return a.maxValue - b.maxValue; });
+    var used = {};
+    for (var i = grp.length - 1; i >= 0; i--) {
+      if (used[grp[i].id]) continue;
+      var rec = grp[i], play = null;
+      for (var j = 0; j < grp.length; j++) {
+        if (used[grp[j].id] || grp[j].id === rec.id) continue;
+        if (rec.maxValue - grp[j].maxValue >= gap) { play = grp[j]; break; }
+      }
+      if (play) {
+        bonus += _basePlayScore(play, cfg) * w * pw(rec.maxValue);
+        used[play.id] = true;
+        used[rec.id] = true;
+      }
+    }
+  }
+  return bonus;
+}
+
+function _teamSupport(plays, tmCardCnt, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (!tmCardCnt || tmCardCnt <= 0) return 0;
+  var r = tmCardCnt, bonus = 0;
+  if (r >= cfg.teamFewerMin && r <= cfg.teamFewerMax) {
+    plays.forEach(function(p) {
+      if (p.cardCount < r) bonus += _basePlayScore(p, cfg) * cfg.teamWFewer * (r - p.cardCount) / r;
+    });
+  } else if (r <= cfg.teamMatchMax) {
+    plays.forEach(function(p) {
+      if (p.cardCount === r) bonus += _basePlayScore(p, cfg) * cfg.teamWMatch;
+    });
+  }
+  return bonus;
+}
+
+function _partnerPenalty(state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (state.isOpponentCard) return 0;
+  var w = cfg.partnerWBase;
+  var fR = state.tmHasBigJoker ? cfg.partnerRecBigJoker : (state.tmHasStrong ? cfg.partnerRecStrong : cfg.partnerRecNormal);
+  var rTm = state.tmMinCards > 0 ? state.tmMinCards : 10;
+  var fC = rTm <= 2 ? cfg.partnerCardLe2 : (rTm <= 5 ? cfg.partnerCard3to5 : cfg.partnerCardGt5);
+  var fD = state.myHands <= 2 ? cfg.partnerDespLe2 : (state.myHands <= 4 ? cfg.partnerDesp3to4 : cfg.partnerDespGe5);
+  var penalty = w * fR * fC * fD;
+  if (state.leadIsBomb && state.myPlayIsBomb) penalty += cfg.partnerBombOnBomb;
+  return penalty;
+}
+
+function _proactiveScore(plays, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var r = state.myRemCards;
+  var R = _estimateMinHands(state.myHands ? plays.map(function(p){return p;}).length : r, cfg);
+  var n = plays.length;
+  var adjSum = 0;
+  for (var i = 0; i < plays.length; i++) adjSum += _basePlayScore(plays[i], cfg);
+  return (adjSum + _playRecoverBonus(plays, cfg) + _teamSupport(plays, state.tmMinCards, cfg))
+    * _handFactor(n, cfg) * _cardCountFactor(r, cfg) * _phaseFactor(R, cfg);
+}
+
+function _reactiveScorePass(curPlays, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var n = curPlays.length;
+  if (n === 0) return 0;
+  var totalAdj = 0;
+  for (var i = 0; i < curPlays.length; i++) {
+    totalAdj += _basePlayScore(curPlays[i], cfg);
+  }
+  var avgHandValue = totalAdj / n;
+  var handPenalty = Math.max(0.15, 0.5 - n * 0.03);
+  var R = _estimateMinHands(state.myHands, cfg);
+  var phase = _phaseFactor(R, cfg);
+  return avgHandValue * handPenalty * phase * _handFactor(n, cfg);
+}
+
+function _reactiveScorePlay(play, remainingCards, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var level = state.level;
+  var rP = state.myRemCards - play.cardCount;
+  var nP = remainingCards.length;
+  var sPlay = _basePlayScore(play, cfg) - _wildPenalty(play, state.bestWildPri, cfg);
+
+  var progressBonus = play.cardCount * 3.5;
+  if (play.maxValue >= 14) progressBonus += 8;
+  else if (play.maxValue >= 12) progressBonus += 4;
+  if (_isBomb(play)) progressBonus += 30;
+
+  var sRem = 0;
+  for (var i = 0; i < remainingCards.length; i++) sRem += _cardValue(remainingCards[i].rank, level);
+  var avgRem = nP > 0 ? sRem / nP : 0;
+
+  var stateWithBomb = {
+    isOpponentCard: state.isOpponentCard,
+    tmHasBigJoker: state.tmHasBigJoker,
+    tmHasStrong: state.tmHasStrong,
+    tmMinCards: state.tmMinCards,
+    myHands: state.myHands,
+    myRemCards: state.myRemCards,
+    leadIsBomb: state.leadIsBomb,
+    myPlayIsBomb: _isBomb(play),
+    leadPlay: state.leadPlay,
+    teammatePassed: state.teammatePassed,
+    upstreamIsOpponent: state.upstreamIsOpponent,
+    upstreamIsBigBomb: state.upstreamIsBigBomb
+  };
+  var tactical = _avgStBonus(remainingCards, rP, cfg)
+    + _blockReward(play, state, cfg)
+    + _emergencyBlock(play, state, cfg)
+    - _partnerPenalty(stateWithBomb, cfg);
+
+  var score = sPlay + progressBonus + avgRem * 0.3 + tactical;
+
+  // Progress: hands reduction bonus
+  var curHands = _estimateMinHands(state.allCards, {isWild: function(c){return c.rank===level&&c.suit==='♥';}});
+  var newHands = _estimateMinHands(remainingCards, {isWild: function(c){return c.rank===level&&c.suit==='♥';}});
+  score += (curHands - newHands) * 80;
+
+  return score;
+}
+
+function _avgStBonus(remCards, r, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  var avg = _avgStrength(remCards, cfg._level || 5);
+  var phase = _gamePhase(r, cfg);
+  var factor = phase === 'early' ? cfg.avgEarlyFactor : (phase === 'mid' ? cfg.avgMidFactor : cfg.avgLateFactor);
+  return Math.min(Math.max(0, 1 - avg) * factor * 100, cfg.avgMaxBonus);
+}
+
+function _blockReward(play, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (!state.isOpponentCard) return 0;
+  var r = state.myRemCards;
+  var phase = _gamePhase(r, cfg);
+  if (phase === 'early') return 0;
+  if (state.nextOpp > cfg.blockCloseThresh) return 0;
+  if (state.myHands <= 2) return 0;
+  var reward = cfg.blockBaseReward * (phase === 'late' ? cfg.blockLateMul : cfg.blockMidMul);
+  var maxV = play.maxValue || 0;
+  reward *= (1 + Math.max(0, (maxV - 10) / 7) * cfg.blockSizeCoeff);
+  if (state.nextOpp <= cfg.blockCloseThresh) reward *= (1 + (cfg.blockCloseThresh - state.nextOpp + 1) * 0.3);
+  return reward;
+}
+
+function _emergencyBlock(play, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (state.nextOpp > cfg.blockCloseThresh) return 0;
+  if (!state.isOpponentCard) return 0;
+  var reward = cfg.blockBaseReward * cfg.blockEmergencyMul;
+  var maxV = play.maxValue || 0;
+  reward *= (1 + Math.max(0, (maxV - 8) / 9) * cfg.blockEmergencySizeCoeff);
+  if (_isBomb(play)) reward *= cfg.blockQualityEta;
+  return reward;
+}
+
+// === 主动出牌策略 ===
+function aiLead(pi, hand) {
+  try {
+    var self = this;
+    var level = self.lvl;
+
+    // 快速路径: 可一手出完
+    var full = self.detect(hand);
+    if (full) return hand.slice();
+    if (hand.length === 1) return [hand[0]];
+    if (hand.length === 2) {
+      var h2 = self.detect(hand);
+      if (h2) return hand.slice();
+      return [self.sort(hand.slice())[hand.length - 1]];
+    }
+
+    // 构建游戏状态
+    var oppCards = [], tmCards = [];
+    for (var i = 0; i < 4; i++) {
+      if (i === pi || self.finished.indexOf(i) >= 0) continue;
+      if (self.areTeammates(i, pi)) tmCards.push(self.players[i].hand.length);
+      else oppCards.push(self.players[i].hand.length);
+    }
+    var tmMin = tmCards.length ? Math.min.apply(null, tmCards) : 999;
+
+    var state = {
+      pi: pi,
+      level: level,
+      myRemCards: hand.length,
+      myHands: 0,
+      oppCards: oppCards,
+      tmCards: tmCards,
+      tmMinCards: tmMin,
+      tmHasBigJoker: false,
+      tmHasStrong: false,
+      isOpponentCard: false,
+      bestWildPri: _findBestWildPriority(hand, level, self),
+      allCards: hand,
+      nextOpp: oppCards.length ? Math.min.apply(null, oppCards) : 27,
+      upstreamCount: 0,
+      upstreamIsAce: false,
+      upstreamFromTeam: false,
+      isLead: true
+    };
+
+    var decomp = _decomposeHand(hand, state, self, EVAL_CONFIG);
+    if (!decomp || !decomp.length) {
+      var s = self.sort(hand.slice());
+      return [s[s.length - 1]];
+    }
+    state.myHands = decomp.length;
+
+    // 选择首手出牌
+    var bestIdx = 0, bestScore = -Infinity;
+    for (var di = 0; di < decomp.length; di++) {
+      var p = decomp[di];
+      var score = 0;
+
+      // 炸弹降权(保留收尾)
+      if (_isBomb(p)) score -= 5000;
+      // 逢人配出普通牌型降权
+      if (p.usesWild && p.type < 8 && p.type !== 10) score -= 2000;
+
+      // 计算出牌后剩余
+      var playIds = {};
+      p.cards.forEach(function(c) { playIds[c.id] = true; });
+      var remaining = hand.filter(function(c) { return !playIds[c.id]; });
+
+      if (remaining.length === 0) { score += 50000; }
+      else {
+        var remHands = _estimateMinHands(remaining, self);
+        score -= remHands * 150;
+        var remTotal = 0;
+        for (var ri = 0; ri < remaining.length; ri++) remTotal += _cardValue(remaining[ri].rank, level);
+        score += (remaining.length > 0 ? remTotal / remaining.length : 0) * 3;
+        score += p.cardCount * 15;
+      }
+
+      // 低价值牌优先
+      score -= p.maxValue * 8;
+
+      // v17.2: 保守策略——保留v5.0核心评分，只做关键修复
+
+      // v17.0: 残局单牌策略（函数驱动）
+      score += _lateGameSingleBonus(p, hand, decomp, state, self);
+
+      // v17.0: 2先出逻辑——下家剩1-2张时出同牌型送牌→惩罚
+      score += _twoLeadPenalty(p, state, self);
+
+      // 搭档配合
+      if (tmMin >= 3 && tmMin <= 5 && p.cardCount < tmMin) score += 200;
+      if (tmMin <= 2 && p.cardCount === tmMin) score += 300;
+
+      if (score > bestScore) { bestScore = score; bestIdx = di; }
+    }
+
+    return decomp[bestIdx].cards;
+
+  } catch (e) {
+    try { var s2 = this.sort(hand.slice()); return [s2[s2.length - 1]]; }
+    catch (e2) { return [hand[hand.length - 1]]; }
+  }
+}
+
+// === 跟牌策略 ===
+function aiFollow(pi, hand) {
+  try {
+    var self = this;
+    var level = self.lvl;
+
+    var allBeating = self.findBeating(hand);
+    if (!allBeating || !allBeating.length) return null;
+
+    // 构建游戏状态
+    var oppCards = [], tmCards = [];
+    for (var i = 0; i < 4; i++) {
+      if (i === pi || self.finished.indexOf(i) >= 0) continue;
+      if (self.areTeammates(i, pi)) tmCards.push(self.players[i].hand.length);
+      else oppCards.push(self.players[i].hand.length);
+    }
+    var tmMin = tmCards.length ? Math.min.apply(null, tmCards) : 999;
+    var oppMin = oppCards.length ? Math.min.apply(null, oppCards) : 27;
+
+    var isOpponent = true;
+    if (self.leadWho >= 0) isOpponent = !self.areTeammates(self.leadWho, pi);
+
+    var nextOpp = oppMin;
+    var nextIdx = (pi + 3) % 4;
+    if (!self.areTeammates(nextIdx, pi) && self.finished.indexOf(nextIdx) < 0) {
+      if (self.players[nextIdx].hand.length < nextOpp) nextOpp = self.players[nextIdx].hand.length;
+    }
+
+    var oppClose = oppMin <= 3;
+
+    var leadIsBomb = false;
+    if (!isOpponent && self.leadHand) {
+      if (self.leadHand.t >= 8 || self.leadHand.t === 10) leadIsBomb = true;
+    }
+
+    // === 队友出牌: 绝对不压(除非能一手出完) ===
+    if (!isOpponent) {
+      // 只有在能一手出完时才压队友
+      var canFinish = self.detect(hand);
+      if (canFinish && self.canBeat(hand, self.leadHand)) return hand.slice();
+      return null;
+    }
+
+    var leadPlay = null;
+    if (isOpponent && self.leadCards && self.leadCards.length && self.leadHand) {
+      leadPlay = _playFromDetect(self.leadCards, self.leadHand, level);
+    }
+
+    var teammatePassed = self.passes >= 1 && isOpponent;
+
+    var upstreamIsOpponent = false;
+    var upstreamIsBigBomb = false;
+    if (self.leadWho >= 0 && isOpponent) {
+      var upstreamIdx = (pi + 1) % 4;
+      if (self.leadWho === upstreamIdx) {
+        upstreamIsOpponent = true;
+        if (leadPlay && _isBomb(leadPlay)) {
+          if (_basePlayScore(leadPlay, EVAL_CONFIG) >= 250) upstreamIsBigBomb = true;
+        }
+      }
+    }
+
+    var state = {
+      pi: pi,
+      level: level,
+      myRemCards: hand.length,
+      myHands: 0,
+      oppCards: oppCards,
+      tmCards: tmCards,
+      tmMinCards: tmMin,
+      tmHasBigJoker: false,
+      tmHasStrong: false,
+      isOpponentCard: isOpponent,
+      bestWildPri: _findBestWildPriority(hand, level, self),
+      allCards: hand,
+      nextOpp: nextOpp,
+      upstreamCount: 0,
+      upstreamIsAce: false,
+      upstreamFromTeam: false,
+      leadIsBomb: leadIsBomb,
+      myPlayIsBomb: false,
+      leadPlay: leadPlay,
+      teammatePassed: teammatePassed,
+      upstreamIsOpponent: upstreamIsOpponent,
+      upstreamIsBigBomb: upstreamIsBigBomb
+    };
+
+    var curDecomp = _decomposeHand(hand, state, self, EVAL_CONFIG);
+    if (!curDecomp || !curDecomp.length) curDecomp = _decomposeHand(hand, state, self, EVAL_CONFIG);
+    state.myHands = curDecomp.length;
+
+    // === 重写scorePass: 用单手平均价值×衰减 ===
+    var curEstHands = _estimateMinHands(hand, self);
+    var handTotal = 0;
+    for (var hvi = 0; hvi < hand.length; hvi++) handTotal += _cardValue(hand[hvi].rank, level);
+    var avgHandVal = hand.length > 0 ? handTotal / hand.length : 0;
+    var handPenalty = Math.max(0.06, 0.32 - curEstHands * 0.025);
+    var phaseBonus = hand.length <= 8 ? 1.6 : (hand.length <= 15 ? 1.0 : 0.55);
+    var scorePass = avgHandVal * handPenalty * phaseBonus;
+
+    // 降低过牌分
+    if (oppClose) scorePass -= 350;
+    if (teammatePassed) scorePass -= 130;
+    if (hand.length <= 12) scorePass -= 35;
+    if (hand.length <= 8) scorePass -= 70;
+    if (hand.length <= 4) scorePass -= 130;
+    if (isOpponent) scorePass -= 25;
+
+    var bestScore = scorePass;
+    var bestPlay = null;
+
+    for (var bi = 0; bi < allBeating.length; bi++) {
+      var playCards = allBeating[bi];
+      var ht = self.detect(playCards);
+      if (!ht) continue;
+
+      var playObj = _playFromDetect(playCards, ht, level);
+
+      var usesWild = false;
+      for (var wi = 0; wi < playCards.length; wi++) {
+        if (self.isWild(playCards[wi])) { usesWild = true; break; }
+      }
+
+      var isBombPlay = playObj.type >= 8;
+
+      // v17.0: 炸弹限制——改为评分惩罚，避免硬跳过导致误拆炸弹
+      var bombPenalty = 0;
+      if (isBombPlay && isOpponent) {
+        var playIds2 = {};
+        playCards.forEach(function(c) { playIds2[c.id] = true; });
+        var remaining2 = hand.filter(function(c) { return !playIds2[c.id]; });
+        // 能一手出完的炸弹可以出
+        if (remaining2.length === 0) {}
+        // 对手快赢了可以炸
+        else if (oppClose) {}
+        // 否则，小牌不用大炸弹压
+        else {
+          var leadMaxR = 0;
+          if (self.leadCards) {
+            for (var lmi = 0; lmi < self.leadCards.length; lmi++) {
+              if (!self.isWild(self.leadCards[lmi]) && self.leadCards[lmi].rank < 15 && self.leadCards[lmi].rank > leadMaxR) leadMaxR = self.leadCards[lmi].rank;
+            }
+          }
+          // 改为评分惩罚而非硬跳过
+          if (leadMaxR < 10) {
+            bombPenalty += 5000 + (10 - leadMaxR) * 300;
+          } else if (leadMaxR < 12) {
+            bombPenalty += 2000;
+          }
+        }
+      }
+
+      // v17.0: 检测是否有更小的炸弹可用（用于大炸弹压小炸弹惩罚）
+      var hasSmallerBomb = false;
+      if (isBombPlay && leadIsBomb) {
+        var allBombs = self.findBombs(hand) || [];
+        for (var bIdx = 0; bIdx < allBombs.length; bIdx++) {
+          var bCards = allBombs[bIdx];
+          var bHt = self.detect(bCards);
+          if (bHt && bHt.t >= 8) {
+            var bPlay = _playFromDetect(bCards, bHt, level);
+            if (bPlay.id !== playObj.id && bPlay.rankValue < playObj.rankValue) {
+              hasSmallerBomb = true; break;
+            }
+          }
+        }
+      }
+      state.hasSmallerBomb = hasSmallerBomb;
+
+      var wildPenalty = 0;
+      if (usesWild && playObj.type < 8 && playObj.type !== 10) wildPenalty = 250;
+
+      var playIds = {};
+      for (var pi2 = 0; pi2 < playCards.length; pi2++) playIds[playCards[pi2].id] = true;
+      var remaining = hand.filter(function(c) { return !playIds[c.id]; });
+
+      var sc = _reactiveScorePlay(playObj, remaining, state, EVAL_CONFIG);
+      sc -= wildPenalty;
+      sc -= bombPenalty;
+
+      // v17.0: 炸弹保留策略——早期不用炸弹，小炸弹即可压时不用大炸弹
+      sc -= _bombReservePenalty(playObj, state, EVAL_CONFIG);
+
+      // 手数减少奖励
+      var newHands = _estimateMinHands(remaining, self);
+      sc += (curEstHands - newHands) * 80;
+      sc += playCards.length * 6;
+
+      // 拦截奖励
+      if (oppClose && isOpponent) sc += 180;
+      if (teammatePassed && isOpponent) sc += 70;
+      if (hand.length <= 8 && isOpponent) sc += 45;
+
+      // v17.0: 跟单张时优先出纯单张——有单张能过就过，绝不用炸弹，不过单拆炸弹
+      // 同时保护顺子潜力：优先保留连续单张序列
+      if (leadPlay && leadPlay.type === 1 && leadPlay.cardCount === 1) {
+        if (playObj.type === 1 && playObj.cardCount === 1) {
+          // 检测是否拆炸弹出单张：该 rank 在手牌中原本 >=4 张
+          var cardRank = playCards[0].rank;
+          var sameRankCount = 0;
+          for (var hri = 0; hri < hand.length; hri++) {
+            if (hand[hri].rank === cardRank) sameRankCount++;
+          }
+          if (sameRankCount >= 4) {
+            sc -= 5000; // 拆炸弹出单张→绝对禁止
+          } else {
+            // 纯单张奖励：+800 起步确保高于 pass，小单张额外奖励优先出小的
+            sc += 800;
+            if (playObj.maxValue < 10) sc += 400;
+            else if (playObj.maxValue < 12) sc += 200;
+
+            // v17.2: 顺子潜力评估——优先保留连续单张序列（适度保护）
+            var beforeLen = _getLongestConsecutiveSingles(hand);
+            var afterLen = _getLongestConsecutiveSingles(remaining);
+            if (afterLen >= 4) sc += 800;       // 保留4+连续，接近顺子
+            else if (afterLen === 3) sc += 400;  // 保留3连续
+            else if (afterLen < beforeLen && beforeLen >= 4) sc -= 600; // 破坏已有4+连续序列→惩罚
+          }
+        }
+        if (isBombPlay) {
+          sc -= 10000; // 用炸弹压单张→绝对禁止
+        }
+      }
+
+      // v17.0: 下家送牌检测——不要给下家对手过牌
+      sc += _downstreamSingleBlock(playObj, state, self);
+      sc += _downstreamPairBlock(playObj, state, self);
+
+      // v17.0: 队友配合——队友出牌时，判断自己不打的话下家会不会过牌
+      // 如果队友出的牌下家可能接不住，我们可以接；否则让队友继续跑
+      if (!isOpponent && leadPlay) {
+        var dsIdx = (pi + 1) % 4;
+        var isDsOpponent = !self.areTeammates(dsIdx, pi) && self.finished.indexOf(dsIdx) < 0;
+        if (isDsOpponent) {
+          var dsCards = self.players[dsIdx].hand.length;
+          // 如果下家对手牌多且队友出的牌小，让队友继续跑
+          if (dsCards >= 8 && leadPlay.maxValue < 10) {
+            sc -= 500; // 不抢队友的小牌
+          }
+        }
+      }
+
+      // v17.0: 残局单牌策略（函数驱动）
+      sc += _lateGameSingleBonus(playObj, hand, curDecomp, state, self);
+
+      if (sc > bestScore) { bestScore = sc; bestPlay = playCards; }
+    }
+
+    return bestPlay;
+
+  } catch (e) {
+    try { var all = this.findBeating(hand); return all && all.length ? all[0] : null; }
+    catch (e2) { return null; }
+  }
+}
+
+// === 缺失函数补全 ===
+
+// 1. 纯单张计数（不算王和逢人配）
+function _countPureSingles(hand, level, gameAPI) {
+  var cnt = {};
+  for (var i = 0; i < hand.length; i++) {
+    var c = hand[i];
+    if (gameAPI.isWild(c)) continue;
+    if (c.rank >= 16) continue; // 大小王不算
+    cnt[c.rank] = (cnt[c.rank] || 0) + 1;
+  }
+  var singles = 0;
+  for (var r in cnt) { if (cnt[r] === 1) singles++; }
+  return singles;
+}
+
+// 2. 最长连续单张序列长度（排除王和逢人配，用于顺子保护）
+function _getLongestConsecutiveSingles(hand) {
+  var vals = [];
+  for (var i = 0; i < hand.length; i++) {
+    var c = hand[i];
+    if (c.rank >= 16) continue; // 排除王
+    if (typeof window !== 'undefined' && window.G && window.G.gameAPI && window.G.gameAPI.isWild(c)) continue;
+    vals.push(c.rank);
+  }
+  if (vals.length === 0) return 0;
+  vals.sort(function(a, b) { return a - b; });
+  var uniq = [];
+  for (var j = 0; j < vals.length; j++) {
+    if (j === 0 || vals[j] !== vals[j - 1]) uniq.push(vals[j]);
+  }
+  var maxLen = 1, curLen = 1;
+  for (var k = 1; k < uniq.length; k++) {
+    if (uniq[k] === uniq[k - 1] + 1) { curLen++; maxLen = Math.max(maxLen, curLen); }
+    else { curLen = 1; }
+  }
+  return maxLen;
+}
+
+// 3. 下家单张送牌检测——自己≥4张时下家剩1张还打单张→重罚
+function _downstreamSingleBlock(playObj, state, self) {
+  if (playObj.type !== 1 || playObj.cardCount !== 1) return 0;
+  var dsIdx = (state.pi + 3) % 4;
+  if (self.areTeammates(dsIdx, state.pi)) return 0;
+  if (self.finished.indexOf(dsIdx) >= 0) return 0;
+  var dsCards = self.players[dsIdx].hand.length;
+  if (dsCards !== 1) return 0;
+  // 自己还剩≥4张牌，出单张=直接送走对手
+  if (state.myRemCards >= 4) return -6000;
+  return 0;
+}
+
+// 4. 下家对子送牌检测——自己≥4张时下家剩2张还打对子→重罚
+function _downstreamPairBlock(playObj, state, self) {
+  if (playObj.type !== 2 || playObj.cardCount !== 2) return 0;
+  var dsIdx = (state.pi + 3) % 4;
+  if (self.areTeammates(dsIdx, state.pi)) return 0;
+  if (self.finished.indexOf(dsIdx) >= 0) return 0;
+  var dsCards = self.players[dsIdx].hand.length;
+  if (dsCards !== 2) return 0;
+  if (state.myRemCards >= 4) return -5000;
+  return 0;
+}
+
+// 5. 炸弹保留惩罚——早期不用炸弹，小炸弹可压时不用大炸弹
+function _bombReservePenalty(playObj, state, cfg) {
+  cfg = cfg || EVAL_CONFIG;
+  if (playObj.type < 8) return 0;
+  var penalty = 0;
+  // 早期不用炸弹（手牌>15张）
+  if (state.myRemCards > 15) penalty += 1500;
+  else if (state.myRemCards > 10) penalty += 800;
+  // 大炸弹压小炸弹惩罚
+  if (state.hasSmallerBomb) penalty += 1500;
+  // 炸弹越大惩罚越高（留到后面）
+  if (playObj.type >= 11) penalty += 600;
+  else if (playObj.type >= 9) penalty += 300;
+  return penalty;
+}
+
+// 6. 残局单牌策略（函数驱动）
+function _lateGameSingleBonus(playObj, hand, decomp, state, self) {
+  var bonus = 0;
+  var level = state.level || self.lvl || 5;
+  var oppAlive = 0, tmAlive = 0, oppIdxs = [], tmIdxs = [];
+  for (var i = 0; i < 4; i++) {
+    if (i === state.pi || self.finished.indexOf(i) >= 0) continue;
+    if (self.areTeammates(i, state.pi)) { tmAlive++; tmIdxs.push(i); }
+    else { oppAlive++; oppIdxs.push(i); }
+  }
+  var pureSingles = _countPureSingles(hand, level, self);
+  var dsIdx = (state.pi + 3) % 4;
+  var usIdx = (state.pi + 1) % 4;
+  var dsIsOpp = !self.areTeammates(dsIdx, state.pi) && self.finished.indexOf(dsIdx) < 0;
+  var usIsTm = self.areTeammates(usIdx, state.pi) && self.finished.indexOf(usIdx) < 0;
+
+  // 情形1: 先发，单牌≥3张（不算王/逢人配），优先打单
+  if (state.isLead && pureSingles >= 3 && playObj.type === 1 && playObj.cardCount === 1) {
+    if (playObj.maxValue < 13) bonus += 1200;
+  }
+
+  // 情形2-4: 只剩2张单牌，只剩1个对手（无队友），对手≤2张
+  if (pureSingles === 2 && oppAlive === 1 && tmAlive === 0) {
+    var oppCardCnt = self.players[oppIdxs[0]].hand.length;
+    if (oppCardCnt <= 2 && playObj.type === 1 && playObj.cardCount === 1) {
+      // 先打大的再打小的
+      var singles = _extractPureSingles(hand, level, self);
+      if (singles.length === 2) {
+        if (playObj.maxValue === Math.max(singles[0].value, singles[1].value)) bonus += 2500;
+        else bonus += 800; // 打小的也能接受
+      }
+    }
+  }
+
+  // 情形3扩展: 只剩1个对手在下家，队友在上家，2张单牌→先大后小
+  if (pureSingles === 2 && oppAlive === 1 && tmAlive === 1 && dsIsOpp && usIsTm) {
+    var oppCardCnt2 = self.players[oppIdxs[0]].hand.length;
+    if (playObj.type === 1 && playObj.cardCount === 1) {
+      var singles2 = _extractPureSingles(hand, level, self);
+      if (singles2.length === 2) {
+        var maxV = Math.max(singles2[0].value, singles2[1].value);
+        var minV = Math.min(singles2[0].value, singles2[1].value);
+        // 除非是最小单牌（对家已不可能接走）
+        var isSmallest = _isSmallestPlayedSingle(singles2[0].card, level, self) || _isSmallestPlayedSingle(singles2[1].card, level, self);
+        if (!isSmallest && playObj.maxValue === maxV) bonus += 3000;
+        else if (!isSmallest) bonus += 1000;
+      }
+    }
+  }
+
+  // 情形4: 只剩1个对手在下家只有1张牌，2张单牌→先大后小
+  if (pureSingles === 2 && oppAlive === 1 && dsIsOpp) {
+    var oppCardCnt3 = self.players[oppIdxs[0]].hand.length;
+    if (oppCardCnt3 === 1 && playObj.type === 1 && playObj.cardCount === 1) {
+      var singles3 = _extractPureSingles(hand, level, self);
+      if (singles3.length === 2) {
+        var maxV2 = Math.max(singles3[0].value, singles3[1].value);
+        if (playObj.maxValue === maxV2) bonus += 4000;
+        else bonus += 1500;
+      }
+    }
+  }
+
+  return bonus;
+}
+
+// 7. 提取纯单张列表
+function _extractPureSingles(hand, level, gameAPI) {
+  var cnt = {};
+  var cardMap = {};
+  for (var i = 0; i < hand.length; i++) {
+    var c = hand[i];
+    if (gameAPI.isWild(c)) continue;
+    if (c.rank >= 16) continue;
+    cnt[c.rank] = (cnt[c.rank] || 0) + 1;
+    if (!cardMap[c.rank]) cardMap[c.rank] = c;
+  }
+  var singles = [];
+  for (var r in cnt) {
+    if (cnt[r] === 1) singles.push({ rank: +r, value: _cardValue(+r, level), card: cardMap[r] });
+  }
+  singles.sort(function(a, b) { return a.value - b.value; });
+  return singles;
+}
+
+// 8. 检测某张单牌是否是最小已出牌（对家已不可能接走）
+function _isSmallestPlayedSingle(card, level, gameAPI) {
+  if (card.rank >= 16) return false;
+  if (card.rank >= 14) return false; // 2, A 不算
+  if (gameAPI.playedRanks && typeof gameAPI.playedRanks === 'object') {
+    var played = gameAPI.playedRanks[card.rank] || 0;
+    return played >= 4;
+  }
+  return card.rank <= 4;
+}
+
+// 9. 2先出逻辑：下家对手剩1-2张时，还出下家同牌型且从小到大→惩罚
+function _twoLeadPenalty(playObj, state, self) {
+  if (!state.isLead) return 0;
+  var dsIdx = (state.pi + 3) % 4;
+  if (self.areTeammates(dsIdx, state.pi)) return 0;
+  if (self.finished.indexOf(dsIdx) >= 0) return 0;
+  var dsCards = self.players[dsIdx].hand.length;
+  if (dsCards > 2) return 0;
+  // 下家只剩1-2张，我们还出他的牌型
+  if (dsCards === 1 && playObj.type !== 1) return 0; // 下家剩1张，出单张才会送
+  if (dsCards === 2 && playObj.type !== 2) return 0; // 下家剩2张，出对子才会送
+  // 从小到大出（maxValue小）→重罚
+  if (playObj.maxValue < 10) return -8000;
+  return -3000;
+}
+
+// === 暴露接口 ===
+if (typeof window !== 'undefined' && window.G) {
+  window.G.customAI_new = {
+    aiLead: aiLead,
+    aiFollow: aiFollow
+  };
+}
